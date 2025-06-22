@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-interface IERC20 {
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function approve(address spender, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
+import "contracts/LPContract.sol";
 
 contract EmberManager {
     address[] public operators;
@@ -15,6 +10,11 @@ contract EmberManager {
     address public lastSelectedOperator;
     mapping(uint256 => Transaction) public transactions;
     uint256 public txCounter;
+
+    mapping(string => uint256) public liquidityPool; // symbol => token amount
+    mapping(string => address) public lpTokens;      // symbol => LP token address
+    mapping(address => mapping(string => uint256)) public lpDepositTimestamps; // user => symbol => timestamp
+
 
     mapping(uint256 => mapping(address => bool)) public approvals;
 
@@ -92,6 +92,7 @@ contract EmberManager {
         require(tokenAddr != address(0), "Token not registered");
 
         IERC20(tokenAddr).transfer(txn.receiver, txn.tokenAmount);
+        liquidityPool[txn.tokenSymbol] -= txn.tokenAmount;
     }
 
     function returnFunds(uint256 txId, uint256 returnedAmount) external {
@@ -120,6 +121,7 @@ contract EmberManager {
         require(returnedAmount >= totalOwed, "Insufficient amount with interest");
 
         txn.status = TxStatus.FundsReturned;
+        liquidityPool[txn.tokenSymbol] += returnedAmount;
     }
 
 
@@ -161,6 +163,48 @@ contract EmberManager {
         }
         return false;
     }
+
+    function addLiquidity(string calldata symbol, uint256 amount) external {
+        address tokenAddr = tokenRegistry[symbol];
+        require(tokenAddr != address(0), "Token not registered");
+
+        IERC20 token = IERC20(tokenAddr);
+        require(token.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+
+        liquidityPool[symbol] += amount;
+
+        // Deploy LP token if it doesn't exist
+        if (lpTokens[symbol] == address(0)) {
+            LPToken lp = new LPToken(string(abi.encodePacked(symbol, "-LP")), string(abi.encodePacked("lp", symbol)));
+            lpTokens[symbol] = address(lp);
+        }
+
+        // Mint LP tokens equal to amount
+        LPToken(lpTokens[symbol]).mint(msg.sender, amount);
+        lpDepositTimestamps[msg.sender][symbol] = block.timestamp;
+    }
+
+    function withdrawLiquidity(string calldata symbol, uint256 amount) external {
+        address lpTokenAddr = lpTokens[symbol];
+        require(lpTokenAddr != address(0), "LP token not found");
+
+        LPToken lp = LPToken(lpTokenAddr);
+
+        // Burn LP tokens
+        lp.burn(msg.sender, amount);
+
+        // Calculate interest: 2.5% per year
+        uint256 daysElapsed = (block.timestamp - lpDepositTimestamps[msg.sender][symbol]) / 1 days;
+        uint256 interest = (amount * 25 * daysElapsed) / (1000 * 365); // 2.5% = 25/1000
+
+        uint256 total = amount + interest;
+
+        require(liquidityPool[symbol] >= total, "Not enough liquidity");
+        liquidityPool[symbol] -= total;
+
+        IERC20(tokenRegistry[symbol]).transfer(msg.sender, total);
+    }
+
 
     function getAllOperators() external view returns (address[] memory) {
         return operators;
