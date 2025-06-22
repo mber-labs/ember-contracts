@@ -1,14 +1,37 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-interface IERC20 {
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function approve(address spender, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
+import {IRouterClient} from "@chainlink/contracts-ccip/contracts/interfaces/IRouterClient.sol";
+import {Client} from "@chainlink/contracts-ccip/contracts/libraries/Client.sol";
+import {CCIPReceiver} from "@chainlink/contracts-ccip/contracts/applications/CCIPReceiver.sol";
+import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
+import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/KeeperCompatibleInterface.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+interface IPriceFeed {
+    function latestAnswer() external view returns (int256);
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);
 }
 
-contract EmberManager {
+contract EmberLiquidityToken is ERC20, Ownable {
+    constructor(string memory name, string memory symbol) ERC20(name, symbol) Ownable(msg.sender) {}
+
+    function mint(address to, uint256 amount) external onlyOwner {
+        _mint(to, amount);
+    }
+
+    function burn(address from, uint256 amount) external onlyOwner {
+        _burn(from, amount);
+    }
+}
+
+contract EmberManager is CCIPReceiver, VRFConsumerBaseV2, KeeperCompatibleInterface {
+    using SafeMath for uint256;
+
     address[] public operators;
     mapping(address => uint256) public operatorStake;
     mapping(address => string) public operatorIPs;
@@ -17,64 +40,287 @@ contract EmberManager {
     uint256 public txCounter;
 
     mapping(uint256 => mapping(address => bool)) public approvals;
-
     mapping(string => address) public tokenRegistry;
+    IPriceFeed public btcUsdPriceFeed;
+
+    // Liquidity pool state
+    EmberLiquidityToken public eltToken;
+    address public usdcToken;
+    uint256 public totalLiquidity;
+    mapping(address => uint256) public liquidityBalance;
+
+    // Liquidation state
+    mapping(uint256 => bool) public liquidationRequested;
+
+    address private s_owner;
 
     enum TxStatus { Pending, FundsBorrowed, FundsReturned, Rejected }
 
     struct Transaction {
         uint256 txId;
         string tokenSymbol;
-        uint256 tokenAmount;
+        uint256 btcCollateralAmount;
         uint256 ltv;
         address receiver;
         TxStatus status;
         uint256 approvalCount;
         uint256 releaseTimestamp;
+        uint64 destinationChainSelector;
+        uint256 tokenAmount;
+        uint256 maxLTV;
+        bool liquidatable;
+    }
+
+    error NotEnoughBalance(uint256 currentBalance, uint256 calculatedFees);
+    error InvalidReceiverAddress();
+    error ReturnedAmountTooLow();
+
+    modifier validateReceiver(address _receiver) {
+        if (_receiver == address(0)) revert InvalidReceiverAddress();
+        _;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == s_owner, "Not owner");
+        _;
     }
 
     event NewOperatorRegistered(address operatorAddress, string ip);
     event OperatorDeregistered(address operatorAddress);
     event OperatorSelected(address selectedOperator);
+    event TokensTransferred(bytes32 indexed messageId, uint64 indexed destinationChainSelector, address receiver, address token, uint256 tokenAmount, address feeToken, uint256 fees);
+    event LoanReturnedCrossChain(uint256 txId, uint256 amountReturned, address payer);
+    event MessageFailed(bytes32 indexed messageId, bytes reason);
+    event MessageRecovered(bytes32 indexed messageId);
+    event LiquidityProvided(address indexed provider, uint256 usdcAmount, uint256 eltMinted);
+    event LiquidityRemoved(address indexed provider, uint256 usdcAmount, uint256 eltBurned);
+    event LiquidationCheckPerformed(uint256[] liquidatableTxIds);
+    event LoanMarkedForLiquidation(uint256 indexed txId);
+    event LoanLiquidated(uint256 indexed txId, address indexed operator, uint256 usdcReceived);
 
-    function selectOperator(uint256 randomNumber) external returns (address) {
+    IRouterClient private s_router;
+
+    // Chainlink VRF variables
+    VRFCoordinatorV2Interface COORDINATOR;
+    uint64 public vrfSubscriptionId;
+    bytes32 public vrfKeyHash;
+    uint32 public vrfCallbackGasLimit = 100000;
+    uint16 public vrfConfirmations = 3;
+    uint32 public vrfNumWords = 1;
+
+    constructor(
+        address _router,
+        address _btcUsdPriceFeed,
+        address _vrfCoordinator,
+        uint64 _subscriptionId,
+        bytes32 _keyHash,
+        address _usdcToken
+    ) CCIPReceiver(_router) VRFConsumerBaseV2(_vrfCoordinator) {
+        s_router = IRouterClient(_router);
+        btcUsdPriceFeed = IPriceFeed(_btcUsdPriceFeed);
+        COORDINATOR = VRFCoordinatorV2Interface(_vrfCoordinator);
+        vrfSubscriptionId = _subscriptionId;
+        vrfKeyHash = _keyHash;
+        usdcToken = _usdcToken;
+        eltToken = new EmberLiquidityToken("Ember Liquidity Token", "ELT");
+        tokenRegistry["USDC"] = _usdcToken;
+        s_owner = msg.sender;
+        eltToken.transferOwnership(address(this));
+    }
+
+    function provideLiquidity(uint256 usdcAmount) external {
+        require(usdcAmount > 0, "Amount must be greater than zero");
+        require(IERC20(usdcToken).transferFrom(msg.sender, address(this), usdcAmount), "USDC transfer failed");
+
+        uint256 eltToMint;
+        if (totalLiquidity == 0) {
+            eltToMint = usdcAmount.mul(10**18).div(10**6);
+        } else {
+            eltToMint = usdcAmount.mul(eltToken.totalSupply()).div(totalLiquidity);
+        }
+
+        totalLiquidity = totalLiquidity.add(usdcAmount);
+        liquidityBalance[msg.sender] = liquidityBalance[msg.sender].add(usdcAmount);
+
+        eltToken.mint(msg.sender, eltToMint);
+
+        emit LiquidityProvided(msg.sender, usdcAmount, eltToMint);
+    }
+
+    function removeLiquidity(uint256 eltAmount) external {
+        require(eltAmount > 0, "Amount must be greater than zero");
+        require(eltToken.balanceOf(msg.sender) >= eltAmount, "Insufficient ELT balance");
+
+        uint256 usdcAmount = eltAmount.mul(totalLiquidity).div(eltToken.totalSupply());
+        require(usdcAmount <= totalLiquidity, "Insufficient liquidity");
+        require(IERC20(usdcToken).balanceOf(address(this)) >= usdcAmount, "Contract has insufficient USDC");
+
+        totalLiquidity = totalLiquidity.sub(usdcAmount);
+        liquidityBalance[msg.sender] = liquidityBalance[msg.sender].sub(usdcAmount);
+
+        eltToken.burn(msg.sender, eltAmount);
+
+        require(IERC20(usdcToken).transfer(msg.sender, usdcAmount), "USDC transfer failed");
+
+        emit LiquidityRemoved(msg.sender, usdcAmount, eltAmount);
+    }
+
+    function checkUpkeep(bytes calldata /* checkData */) external view override returns (bool upkeepNeeded, bytes memory performData) {
+        uint256[] memory liquidatableTxIds = new uint256[](txCounter);
+        uint256 count = 0;
+
+        (, int256 btcPriceUsd, , uint256 updatedAt, ) = btcUsdPriceFeed.latestRoundData();
+        if (btcPriceUsd <= 0 || block.timestamp - updatedAt > 1 hours) {
+            return (false, bytes(""));
+        }
+
+        for (uint256 i = 0; i < txCounter; i++) {
+            Transaction storage txn = transactions[i];
+            if (txn.status == TxStatus.FundsBorrowed && !liquidationRequested[i]) {
+                uint256 currentCollateralValue = txn.btcCollateralAmount.mul(uint256(btcPriceUsd)).div(1e8);
+                uint256 currentLTV = txn.tokenAmount.mul(100).div(currentCollateralValue);
+                if (currentLTV > txn.maxLTV) {
+                    liquidatableTxIds[count] = i;
+                    count++;
+                }
+            }
+        }
+
+        if (count > 0) {
+            uint256[] memory result = new uint256[](count);
+            for (uint256 j = 0; j < count; j++) {
+                result[j] = liquidatableTxIds[j];
+            }
+            upkeepNeeded = true;
+            performData = abi.encode(result);
+        } else {
+            upkeepNeeded = false;
+            performData = bytes("");
+        }
+
+        return (upkeepNeeded, performData);
+    }
+
+    function performUpkeep(bytes calldata performData) external override {
+        uint256[] memory liquidatableTxIds = abi.decode(performData, (uint256[]));
+
+        for (uint256 i = 0; i < liquidatableTxIds.length; i++) {
+            uint256 txId = liquidatableTxIds[i];
+            Transaction storage txn = transactions[txId];
+            if (txn.status == TxStatus.FundsBorrowed && !liquidationRequested[txId]) {
+                (, int256 btcPriceUsd, , uint256 updatedAt, ) = btcUsdPriceFeed.latestRoundData();
+                require(btcPriceUsd > 0, "Invalid BTC price");
+                require(block.timestamp - updatedAt < 1 hours, "Stale price feed");
+                uint256 currentCollateralValue = txn.btcCollateralAmount.mul(uint256(btcPriceUsd)).div(1e8);
+                uint256 currentLTV = txn.tokenAmount.mul(100).div(currentCollateralValue);
+                if (currentLTV > txn.maxLTV) {
+                    txn.liquidatable = true;
+                    liquidationRequested[txId] = true;
+                    emit LoanMarkedForLiquidation(txId);
+                }
+            }
+        }
+
+        emit LiquidationCheckPerformed(liquidatableTxIds);
+    }
+
+    function liquidateLoan(uint256 txId) external {
+        require(msg.sender == lastSelectedOperator, "Not authorized");
+        Transaction storage txn = transactions[txId];
+        require(txn.status == TxStatus.FundsBorrowed, "Loan not active");
+        require(txn.liquidatable, "Loan not liquidatable");
+        require(txn.tokenSymbol == "USDC", "Only USDC loans supported");
+
+        uint256 usdcReceived = txn.tokenAmount;
+        require(IERC20(usdcToken).transferFrom(msg.sender, address(this), usdcReceived), "USDC transfer failed");
+
+        totalLiquidity = totalLiquidity.add(usdcReceived);
+        liquidityBalance[address(this)] = liquidityBalance[address(this)].add(usdcReceived);
+
+        txn.status = TxStatus.FundsReturned;
+        liquidationRequested[txId] = false;
+        txn.liquidatable = false;
+
+        emit LoanLiquidated(txId, msg.sender, usdcReceived);
+    }
+
+    function requestOperatorSelection() external returns (uint256 requestId) {
         require(operators.length > 0, "No operators registered");
-        uint256 index = randomNumber % operators.length;
+        requestId = COORDINATOR.requestRandomWords(
+            vrfKeyHash,
+            vrfSubscriptionId,
+            vrfConfirmations,
+            vrfCallbackGasLimit,
+            vrfNumWords
+        );
+    }
+
+    function fulfillRandomWords(uint256, uint256[] memory randomWords) internal override {
+        uint256 index = randomWords[0] % operators.length;
         lastSelectedOperator = operators[index];
         emit OperatorSelected(lastSelectedOperator);
-        return lastSelectedOperator;
-    }   
+    }
 
-    function createTransaction(
-        string calldata tokenSymbol,
-        uint256 tokenAmount,
-        uint256 ltv,
-        address receiver
-    ) external {
+    function transferTokensPayNative(uint64 _destinationChainSelector, address _receiver, address _token, uint256 _amount) internal validateReceiver(_receiver) returns (bytes32 messageId) {
+        Client.EVM2AnyMessage memory evm2AnyMessage = _buildCCIPMessage(_receiver, _token, _amount, address(0));
+
+        uint256 fees = s_router.getFee(_destinationChainSelector, evm2AnyMessage);
+
+        if (fees > address(this).balance)
+            revert NotEnoughBalance(address(this).balance, fees);
+
+        IERC20(_token).approve(address(s_router), _amount);
+
+        messageId = s_router.ccipSend{value: fees}(_destinationChainSelector, evm2AnyMessage);
+
+        emit TokensTransferred(messageId, _destinationChainSelector, _receiver, _token, _amount, address(0), fees);
+        return messageId;
+    }
+
+    function _buildCCIPMessage(address _receiver, address _token, uint256 _amount, address _feeTokenAddress) private pure returns (Client.EVM2AnyMessage memory) {
+        Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](1);
+        tokenAmounts[0] = Client.EVMTokenAmount({token: _token, amount: _amount});
+
+        return Client.EVM2AnyMessage({
+            receiver: abi.encode(_receiver),
+            data: "",
+            tokenAmounts: tokenAmounts,
+            extraArgs: Client._argsToBytes(Client.GenericExtraArgsV2({gasLimit: 0, allowOutOfOrderExecution: true})),
+            feeToken: _feeTokenAddress
+        });
+    }
+
+    receive() external payable {}
+
+    function createTransaction(string calldata tokenSymbol, uint256 btcCollateralAmount, uint256 ltv, address receiver, uint64 destinationChainSelector, uint256 maxLTV) external {
         require(msg.sender == lastSelectedOperator, "Not authorized");
+        require(maxLTV >= ltv && maxLTV <= 100, "Invalid maxLTV");
 
         transactions[txCounter] = Transaction({
             txId: txCounter,
             tokenSymbol: tokenSymbol,
-            tokenAmount: tokenAmount,
+            btcCollateralAmount: btcCollateralAmount,
             ltv: ltv,
             receiver: receiver,
             status: TxStatus.Pending,
-            approvalCount: uint256(0),
-            releaseTimestamp: block.timestamp
+            approvalCount: 0,
+            releaseTimestamp: block.timestamp,
+            destinationChainSelector: destinationChainSelector,
+            tokenAmount: 0,
+            maxLTV: maxLTV,
+            liquidatable: false
         });
 
         txCounter++;
     }
 
-   function approveTransaction(uint256 txId) external {
+    function approveTransaction(uint256 txId) external {
         require(txId < txCounter, "Invalid txId");
         require(!approvals[txId][msg.sender], "Already approved");
 
         approvals[txId][msg.sender] = true;
-        transactions[txId].approvalCount += 1;
+        transactions[txId].approvalCount++;
 
-        // ✅ If approvals > 2/3 of total operators, mark as Approved
         uint256 required = (operators.length * 2) / 3;
 
         if (transactions[txId].approvalCount > required) {
@@ -85,13 +331,58 @@ contract EmberManager {
 
     function releaseFunds(uint256 txId) internal {
         Transaction storage txn = transactions[txId];
-
         require(txn.status == TxStatus.FundsBorrowed, "Tx not approved");
 
         address tokenAddr = tokenRegistry[txn.tokenSymbol];
         require(tokenAddr != address(0), "Token not registered");
+        require(tokenAddr == usdcToken, "Only USDC loans supported");
 
-        IERC20(tokenAddr).transfer(txn.receiver, txn.tokenAmount);
+        (, int256 btcPriceUsd, , uint256 updatedAt, ) = btcUsdPriceFeed.latestRoundData();
+        require(btcPriceUsd > 0, "Invalid BTC price");
+        require(block.timestamp - updatedAt < 1 hours, "Stale price feed");
+
+        uint256 usdValue = txn.btcCollateralAmount.mul(uint256(btcPriceUsd)).div(1e8);
+        uint256 tokenAmount = usdValue.mul(txn.ltv).div(100);
+        txn.tokenAmount = tokenAmount;
+
+        require(tokenAmount <= totalLiquidity, "Insufficient liquidity");
+        require(IERC20(usdcToken).balanceOf(address(this)) >= tokenAmount, "Contract has insufficient USDC");
+
+        if (txn.destinationChainSelector == 5009297550715157269)
+            IERC20(tokenAddr).transfer(txn.receiver, tokenAmount);
+        else
+            transferTokensPayNative(txn.destinationChainSelector, txn.receiver, tokenAddr, tokenAmount);
+    }
+
+    function ccipReceive(Client.Any2EVMMessage calldata message) external override onlyRouter {
+        try this.processMessage(message) {
+        } catch {
+            revert("Failed to process message");
+        }
+    }
+
+    function processMessage(Client.Any2EVMMessage calldata message) external {
+        require(msg.sender == address(this), "Only self can call processMessage");
+        _ccipReceive(message);
+    }
+
+    function _ccipReceive(Client.Any2EVMMessage memory message) internal override {
+        (uint256 txId, uint256 amountReturned, address payer) = abi.decode(message.data, (uint256, uint256, address));
+
+        Transaction storage txn = transactions[txId];
+        require(txn.status == TxStatus.FundsBorrowed, "Loan not active");
+
+        address tokenAddr = tokenRegistry[txn.tokenSymbol];
+        require(tokenAddr != address(0), "Token not registered");
+
+        uint256 daysPassed = (block.timestamp - txn.releaseTimestamp) / 1 days;
+        uint256 interest = (txn.tokenAmount * 5 * daysPassed) / (100 * 365);
+        uint256 totalOwed = txn.tokenAmount + interest;
+
+        if (amountReturned < totalOwed) revert ReturnedAmountTooLow();
+
+        txn.status = TxStatus.FundsReturned;
+        emit LoanReturnedCrossChain(txId, amountReturned, payer);
     }
 
     function returnFunds(uint256 txId, uint256 returnedAmount) external {
@@ -101,27 +392,15 @@ contract EmberManager {
         address tokenAddr = tokenRegistry[txn.tokenSymbol];
         require(tokenAddr != address(0), "Token not registered");
 
-        // ✅ Calculate number of days passed
         uint256 daysPassed = (block.timestamp - txn.releaseTimestamp) / 1 days;
-
-        // ✅ Interest = principal * rate * time
-        // 5% per year ≈ 0.0137% per day → 0.000137 ether per ether/day
-        // interest = (principal * 5 * days) / (100 * 365)
         uint256 interest = (txn.tokenAmount * 5 * daysPassed) / (100 * 365);
-
         uint256 totalOwed = txn.tokenAmount + interest;
 
-        // ✅ Take tokens from caller
-        require(
-            IERC20(tokenAddr).transferFrom(msg.sender, address(this), returnedAmount),
-            "Transfer failed"
-        );
-
+        require(IERC20(tokenAddr).transferFrom(msg.sender, address(this), returnedAmount), "Transfer failed");
         require(returnedAmount >= totalOwed, "Insufficient amount with interest");
 
         txn.status = TxStatus.FundsReturned;
     }
-
 
     function registerOperator(string memory ip) public payable {
         require(msg.value >= 1 ether, "Operator required to stake exactly 1 ETH");
@@ -135,23 +414,20 @@ contract EmberManager {
         emit NewOperatorRegistered(msg.sender, ip);
     }
 
-    function registerToken(string calldata symbol, address tokenAddress) external {
+    function registerToken(string calldata symbol, address tokenAddress) external onlyOwner {
         tokenRegistry[symbol] = tokenAddress;
     }
 
     function deregisterOperator() external returns (bool) {
         for (uint i = 0; i < operators.length; i++) {
             if (operators[i] == msg.sender) {
-                // Remove from operators array
                 operators[i] = operators[operators.length - 1];
                 operators.pop();
 
-                // Clear mappings
                 uint256 amount = operatorStake[msg.sender];
                 operatorStake[msg.sender] = 0;
                 delete operatorIPs[msg.sender];
 
-                // Transfer back the stake
                 (bool success, ) = msg.sender.call{value: amount}("");
                 require(success, "ETH transfer failed");
 
