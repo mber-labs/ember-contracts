@@ -7,15 +7,12 @@ import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/vrf/inter
 import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
 import {Client} from "@chainlink/contracts/src/v0.8/ccip/libraries/Client.sol";
 import "@chainlink/contracts/src/v0.8/automation/interfaces/KeeperCompatibleInterface.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./EmberLiquidityToken.sol";
 import "./EmberLiquidityPool.sol";
-
-interface IPriceFeed {
-    function latestAnswer() external view returns (int256);
-    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);
-}
 
 contract EmberLoanManager is CCIPReceiver, VRFConsumerBaseV2, KeeperCompatibleInterface, Ownable {
     address[] public operators;
@@ -27,7 +24,7 @@ contract EmberLoanManager is CCIPReceiver, VRFConsumerBaseV2, KeeperCompatibleIn
 
     mapping(uint256 => mapping(address => bool)) public approvals;
     mapping(string => address) public tokenRegistry;
-    IPriceFeed public btcUsdPriceFeed;
+    AggregatorV3Interface public immutable btcUsdPriceFeed;
     EmberLiquidityPool public liquidityPool;
 
     // Liquidation state
@@ -89,7 +86,7 @@ contract EmberLoanManager is CCIPReceiver, VRFConsumerBaseV2, KeeperCompatibleIn
         address _liquidityPool
     ) CCIPReceiver(_router) VRFConsumerBaseV2(_vrfCoordinator) {
         s_router = IRouterClient(_router);
-        btcUsdPriceFeed = IPriceFeed(_btcUsdPriceFeed);
+        btcUsdPriceFeed = AggregatorV3Interface(_btcUsdPriceFeed);
         COORDINATOR = VRFCoordinatorV2Interface(_vrfCoordinator);
         vrfSubscriptionId = _subscriptionId;
         vrfKeyHash = _keyHash;
